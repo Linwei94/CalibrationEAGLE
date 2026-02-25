@@ -6,6 +6,7 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 import argparse
 import json
 import os
+from typing import Any
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
 # os.environ["CUDA_VISIBLE_DEVICES"] = "7"
@@ -114,6 +115,9 @@ def get_model_answers(
         device_map="auto",
         use_eagle3=args.use_eagle3,
     )
+    
+    warmup_calibration_stats = []
+    eval_calibration_stats = []
 
     tokenizer = model.get_tokenizer()
 
@@ -129,9 +133,12 @@ def get_model_answers(
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
 
     question = questions[0]
+    
+    if args.return_calibration_stat:
+        os.makedirs(f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3", exist_ok=True)
 
     # warmup
-    for _ in range(3):
+    for warmup_idx in range(3):
         torch.manual_seed(0)
 
         messages = [
@@ -159,12 +166,19 @@ def get_model_answers(
             torch.cuda.synchronize()
             start_time = time.time()
 
-            output_ids, new_token, idx = model.eagenerate(
-                torch.as_tensor(input_ids).cuda(),
-                temperature=temperature,
-                log=True,
-                is_llama3=True,
-            )
+
+            outputs = model.eagenerate(
+                    torch.as_tensor(input_ids).cuda(),
+                    temperature=temperature,
+                    log=True,
+                    is_llama3=True,
+                    return_calibration_stats=True,
+                )
+            if args.return_calibration_stat:
+                output_ids, new_token, idx, calibration_stats = outputs
+                warmup_calibration_stats.append(calibration_stats)
+            else:
+                output_ids, new_token, idx = outputs
             torch.cuda.synchronize()
             total_time = time.time() - start_time
             output_ids = output_ids[0][len(input_ids[0]):]
@@ -209,9 +223,11 @@ def get_model_answers(
                 "content": output
             })
     print('Warmup done')
+    torch.save(warmup_calibration_stats, f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3/calibration_stats_warmup.pth")
+    
 
     # questions=questions[6:]
-    for question in tqdm(questions):
+    for question_idx, question in tqdm(enumerate(questions), total=len(questions)):
 
         choices = []
         for i in range(num_choices):
@@ -241,12 +257,18 @@ def get_model_answers(
                 torch.cuda.synchronize()
                 start_time = time.time()
 
-                output_ids, new_token, idx = model.eagenerate(
-                    torch.as_tensor(input_ids).cuda(),
-                    temperature=temperature,
-                    log=True,
-                    is_llama3=True,
-                )
+                outputs = model.eagenerate(
+                        torch.as_tensor(input_ids).cuda(),
+                        temperature=temperature,
+                        log=True,
+                        is_llama3=True,
+                        return_calibration_stats=True,
+                    )
+                if args.return_calibration_stat:
+                    output_ids, new_token, idx, calibration_stats = outputs
+                    eval_calibration_stats.append(calibration_stats)
+                else:
+                    output_ids, new_token, idx = outputs
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
                 output_ids = output_ids[0][len(input_ids[0]):]
@@ -302,6 +324,8 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
+            
+    torch.save(eval_calibration_stats, f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3/calibration_stats_eval.pth")
 
 
 def reorg_answer_file(answer_file):
@@ -407,6 +431,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_eagle3",
         action="store_true"
+    )
+    parser.add_argument(
+        "--return_calibration_stat",
+        action="store_true",
+        help="Return the calibration statistics.",
+    )
+    parser.add_argument(
+        "--calibration_stat_file_root",
+        type=str,
+        help="The path to save the calibration statistics. If not provided, the statistics will not be saved.",
     )
 
     args = parser.parse_args()

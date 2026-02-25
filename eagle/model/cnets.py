@@ -667,7 +667,10 @@ class Model(nn.Module):
         self.stable_kv = None
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, return_calibration_stats=False):
+        
+        if return_calibration_stats:
+            draft_probs = []
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -677,6 +680,7 @@ class Model(nn.Module):
         sample_token = input_ids[:, -1]
 
         scores_list = []
+        draft_probs_list = []
         parents_list = []
         ss_token = []
 
@@ -704,6 +708,7 @@ class Model(nn.Module):
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
         scores_list.append(scores[None])
+        draft_probs_list.append(scores[None].exp())
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
         if self.config.vocab_size==self.config.draft_vocab_size:
             ss_token.append(topk_index)
@@ -742,7 +747,7 @@ class Model(nn.Module):
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             scores = topk_cs_p
-
+            
             out_ids = topk_cs_index // top_k
             input_hidden = out_hidden[:, out_ids]
 
@@ -754,10 +759,12 @@ class Model(nn.Module):
                 input_ids = input_ids + self.d2t[input_ids]
                 ss_token.append(topk_index+self.d2t[topk_index])
             scores_list.append(cu_scores)
+            draft_probs_list.append(topk_p.exp())
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
 
 
         scores_list = torch.cat(scores_list, dim=0).view(-1)
+        draft_probs_list = torch.cat(draft_probs_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
@@ -765,7 +772,7 @@ class Model(nn.Module):
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
-
+        draft_probs = draft_probs_list[top_scores_index]
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
@@ -824,7 +831,10 @@ class Model(nn.Module):
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
-        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+        if return_calibration_stats:
+            return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, draft_probs
+        else:
+            return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
 
 

@@ -206,10 +206,18 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
-
+            return_calibration_stats=False,
     ):
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        
+        if return_calibration_stats:
+            calibration_stats = {
+                "draft_tokens": [],
+                "draft_probs": [],
+                "tree_position_ids": [],
+                "target_tokens": [],
+            }
 
 
         if temperature > 1e-5:
@@ -243,13 +251,23 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         # prefill
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
+        outputs = initialize_tree(
+            input_ids, self, past_key_values, logits_processor, return_calibration_stats=return_calibration_stats
         )
+        
+        if return_calibration_stats:
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token, draft_probs = outputs
+        else:
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = outputs
+
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
-            # with Timer("all"):
+            if return_calibration_stats:
+                calibration_stats["draft_tokens"].append(draft_tokens.flatten())
+                calibration_stats["draft_probs"].append(draft_probs.flatten())
+                calibration_stats["tree_position_ids"].append(tree_position_ids.flatten())
+
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
@@ -262,17 +280,21 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            if return_calibration_stats:
+                target_tokens = torch.zeros_like(draft_tokens)
+                target_tokens[0, retrieve_indices[:,1:]] = torch.argmax(logits[:, :-1], dim=-1)
+                calibration_stats["target_tokens"].append(target_tokens.flatten())
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
             # verification
             best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
-            )
+                    logits, candidates, logits_processor
+                )
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            outputs = update_inference_inputs(
                 input_ids,
                 candidates,
                 best_candidate,
@@ -284,8 +306,13 @@ class EaModel(nn.Module):
                 current_length_data,
                 self,
                 hidden_state_new,
-                sample_p
+                sample_p,
+                return_calibration_stats=return_calibration_stats
             )
+            if return_calibration_stats:
+                input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token, draft_probs = outputs
+            else:
+                input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = outputs
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -300,7 +327,10 @@ class EaModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx
+            if return_calibration_stats:
+                return input_ids, new_token, idx, calibration_stats
+            else:
+                return input_ids, new_token, idx
 
     @torch.no_grad()
     def naivegenerate(

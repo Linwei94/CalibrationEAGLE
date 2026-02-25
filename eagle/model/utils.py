@@ -229,7 +229,7 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor):
+def initialize_tree(input_ids, model, past_key_values, logits_processor, return_calibration_stats=False):
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True
     )
@@ -250,8 +250,12 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         if outputs["hidden_states"][0].device != ea_device:
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
         hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
-    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
+    if return_calibration_stats:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids, draft_probs = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor, return_calibration_stats=return_calibration_stats)
+        return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, draft_probs
+    else:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+        return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
 
 def reset_tree_mode(
@@ -338,6 +342,7 @@ def evaluate_posterior(
         logits: torch.Tensor,
         candidates: torch.Tensor,
         logits_processor,
+        return_calibration_stats=False,
 ):
     """
     Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
@@ -351,10 +356,13 @@ def evaluate_posterior(
     - temperature (float): Softmax temperature for probability scaling. A value of 0 indicates greedy decoding.
     - posterior_threshold (float): Threshold for posterior probability.
     - posterior_alpha (float): Scaling factor for the threshold.
+    - return_target_tokens (bool): Whether to return the target tokens.
 
     Returns:
     - best_candidate (torch.Tensor): Index of the chosen best candidate.
     - accept_length (int): Length of the accepted candidate sequence.
+    - sample_p (torch.Tensor): Sample probabilities of the chosen best candidate.
+    - target_tokens (torch.Tensor): Target tokens of the chosen best candidate if return_target_tokens is True.
     """
     # Greedy decoding based on temperature value
     if logits_processor is None:
@@ -412,7 +420,10 @@ def evaluate_posterior(
             gt_logits = logits[best_candidate, accept_length - 1][None]
             gt_logits = logits_processor(None, gt_logits)[0]
             sample_p = torch.softmax(gt_logits, dim=0)
-        return torch.tensor(best_candidate), accept_length - 1, sample_p
+        if return_calibration_stats:
+            return torch.tensor(best_candidate), accept_length - 1, sample_p, 1
+        else:
+            return torch.tensor(best_candidate), accept_length - 1, sample_p
 
 
 @torch.no_grad()
@@ -428,7 +439,8 @@ def update_inference_inputs(
         current_length_data,
         model,
         hidden_state_new,
-        sample_p
+        sample_p,
+        return_calibration_stats=False
 ):
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
@@ -463,14 +475,22 @@ def update_inference_inputs(
         token = torch.argmax(prob)
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
+    outputs = model.ea_layer.topK_genrate(accept_hidden_state_new,
                                               input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+                                              head=model.base_model.lm_head,logits_processor=logits_processor,
+                                              return_calibration_stats=return_calibration_stats)
 
-
+    if return_calibration_stats:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids, draft_probs = outputs
+    else:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = outputs
+    
     new_token += accept_length + 1
 
-    return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
+    if return_calibration_stats:
+        return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token, draft_probs
+    else:
+        return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
 
 
 if __name__ == "__main__":
