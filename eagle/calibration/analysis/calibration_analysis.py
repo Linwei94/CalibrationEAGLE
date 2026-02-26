@@ -7,6 +7,7 @@ References:
 '''
 
 import argparse
+import joblib
 import math
 import torch
 import numpy as np
@@ -229,7 +230,7 @@ class Calibration:
         self.n_bins = n_bins
         self.bin_edges = None
         self.bin_acc = None
-        self.platt_model = None
+        self.platt_model = LogisticRegression()
 
     # -------------------------------------------------
     # Fit
@@ -503,6 +504,9 @@ def main(args):
     N = int(0.2 * len(eval_draft_probs_list))
     calibrator = Calibration(method="platt")
     calibrator.fit(eval_draft_tokens_list[:N], eval_target_tokens_list[:N], eval_draft_probs_list[:N])
+    # save calibrator model, especially for platt scaling
+    os.makedirs(args.calibration_stat_file_root, exist_ok=True)
+    joblib.dump(calibrator.platt_model, f"{args.calibration_stat_file_root}/calibrator_platt.pkl")
     calibrated_probs = calibrator.transform(eval_draft_probs_list[N:])
     plot_reliability_with_error(eval_draft_tokens_list[N:], eval_target_tokens_list[N:], eval_draft_probs_list[N:], calibrated_probs, n_bins=N_BINS, position_id=POSITION_ID, save_path=args.calibration_stat_file_root)
     

@@ -114,6 +114,7 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto",
         use_eagle3=args.use_eagle3,
+        use_calibration=args.use_calibration,
     )
     
     warmup_calibration_stats = []
@@ -172,13 +173,13 @@ def get_model_answers(
                     temperature=temperature,
                     log=True,
                     is_llama3=True,
-                    return_calibration_stats=True,
+                    return_calibration_stats=args.return_calibration_stat,
                 )
             if args.return_calibration_stat:
-                output_ids, new_token, idx, calibration_stats = outputs
+                output_ids, new_token, idx, calibration_stats, alpha_mean = outputs
                 warmup_calibration_stats.append(calibration_stats)
             else:
-                output_ids, new_token, idx = outputs
+                output_ids, new_token, idx, alpha_mean = outputs
             torch.cuda.synchronize()
             total_time = time.time() - start_time
             output_ids = output_ids[0][len(input_ids[0]):]
@@ -223,7 +224,8 @@ def get_model_answers(
                 "content": output
             })
     print('Warmup done')
-    torch.save(warmup_calibration_stats, f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3/calibration_stats_warmup.pth")
+    if args.return_calibration_stat:
+        torch.save(warmup_calibration_stats, f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3/calibration_stats_warmup.pth")
     
 
     # questions=questions[6:]
@@ -262,13 +264,13 @@ def get_model_answers(
                         temperature=temperature,
                         log=True,
                         is_llama3=True,
-                        return_calibration_stats=True,
+                        return_calibration_stats=args.return_calibration_stat,
                     )
                 if args.return_calibration_stat:
-                    output_ids, new_token, idx, calibration_stats = outputs
+                    output_ids, new_token, idx, calibration_stats, alpha_mean = outputs
                     eval_calibration_stats.append(calibration_stats)
                 else:
-                    output_ids, new_token, idx = outputs
+                    output_ids, new_token, idx, alpha_mean = outputs
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
                 output_ids = output_ids[0][len(input_ids[0]):]
@@ -311,7 +313,7 @@ def get_model_answers(
                     "content": output
                 })
             # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time})
+            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "alpha": alpha_mean})
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -322,10 +324,11 @@ def get_model_answers(
                 "model_id": model_id,
                 "choices": choices,
                 "tstamp": time.time(),
+                "alpha": alpha_mean
             }
             fout.write(json.dumps(ans_json) + "\n")
-            
-    torch.save(eval_calibration_stats, f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3/calibration_stats_eval.pth")
+    if args.return_calibration_stat:
+        torch.save(eval_calibration_stats, f"{args.calibration_stat_file_root}/{args.bench_name}/{model_id}/EAGLE3/calibration_stats_eval.pth")
 
 
 def reorg_answer_file(answer_file):
@@ -441,6 +444,11 @@ if __name__ == "__main__":
         "--calibration_stat_file_root",
         type=str,
         help="The path to save the calibration statistics. If not provided, the statistics will not be saved.",
+    )
+    parser.add_argument(
+        "--use_calibration",
+        action="store_true",
+        help="Use calibration.",
     )
 
     args = parser.parse_args()

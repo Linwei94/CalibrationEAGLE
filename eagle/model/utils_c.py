@@ -2,6 +2,8 @@ import torch
 
 # typing
 from typing import List
+import numpy as np
+from sklearn.linear_model import LogisticRegression
 
 TOPK = 10  # topk for sparse tree
 
@@ -197,6 +199,156 @@ def reset_past_key_values(passed_key_values: List[torch.Tensor]) -> List[torch.T
         for j in range(2):
             passed_key_values[i][j].current_length.fill_(0)
     return passed_key_values
+
+
+def _to_numpy_flat(x, force_float=False):
+    """Convert list or tensor to flat numpy array. Returns (arr, shape, device, dtype).
+    force_float: if True, convert to float64 (for confidence); if False, preserve dtype (for labels).
+    """
+    if isinstance(x, torch.Tensor):
+        shape = x.shape
+        device = x.device
+        dtype = x.dtype
+        arr = x.detach().cpu().numpy().flatten()
+        if force_float:
+            arr = arr.astype(np.float64)
+        return arr, shape, device, dtype
+    else:
+        arr = np.array(x).flatten()
+        if force_float:
+            arr = arr.astype(np.float64)
+        return arr, arr.shape, None, None
+
+
+def _from_numpy_to_tensor(arr, shape, device=None, dtype=None):
+    """Convert numpy array to tensor, reshape to original shape."""
+    out = torch.from_numpy(arr.astype(np.float32))
+    if shape is not None:
+        out = out.reshape(shape)
+    if device is not None:
+        out = out.to(device)
+    if dtype is not None:
+        out = out.to(dtype)
+    return out
+
+
+class Calibration:
+    def __init__(self, method="platt", n_bins=15):
+        """
+        method: "histogram" or "platt"
+        n_bins: number of bins for histogram binning
+        Accepts list or tensor (any shape) for fit/transform. transform always returns tensor.
+        """
+        self.method = method
+        self.n_bins = n_bins
+        self.bin_edges = None
+        self.bin_acc = None
+        self.platt_model = LogisticRegression()
+
+    # -------------------------------------------------
+    # Fit
+    # -------------------------------------------------
+    def fit(self, pred_label, gt_label, pred_confidence):
+        pred_label, _, _, _ = _to_numpy_flat(pred_label, force_float=False)
+        gt_label, _, _, _ = _to_numpy_flat(gt_label, force_float=False)
+        pred_confidence, _, _, _ = _to_numpy_flat(pred_confidence, force_float=True)
+
+        correct = (pred_label == gt_label).astype(int)
+
+        if self.method == "histogram":
+            self._fit_histogram(pred_confidence, correct)
+
+        elif self.method == "platt":
+            self._fit_platt(pred_confidence, correct)
+
+        else:
+            raise ValueError("method must be 'histogram' or 'platt'")
+
+    # -------------------------------------------------
+    # Histogram Binning
+    # -------------------------------------------------
+    def _fit_histogram(self, confidences, correct):
+        self.bin_edges = np.linspace(0.0, 1.0, self.n_bins + 1)
+        self.bin_acc = np.zeros(self.n_bins)
+
+        for i in range(self.n_bins):
+            in_bin = (confidences >= self.bin_edges[i]) & \
+                     (confidences < self.bin_edges[i + 1])
+
+            if np.sum(in_bin) > 0:
+                self.bin_acc[i] = np.mean(correct[in_bin])
+            else:
+                self.bin_acc[i] = 0.0
+
+    def _transform_histogram(self, confidences):
+        calibrated = np.zeros_like(confidences)
+
+        for i in range(self.n_bins):
+            in_bin = (confidences >= self.bin_edges[i]) & \
+                     (confidences < self.bin_edges[i + 1])
+            calibrated[in_bin] = self.bin_acc[i]
+
+        return calibrated
+
+    # -------------------------------------------------
+    # Platt Scaling
+    # -------------------------------------------------
+    def _fit_platt(self, confidences, correct):
+        # convert confidence -> logit
+        eps = 1e-6
+        confidences = np.clip(confidences, eps, 1 - eps)
+        logits = np.log(confidences / (1 - confidences)).reshape(-1, 1)
+
+        self.platt_model.fit(logits, correct)
+
+    def _transform_platt(self, confidences):
+        eps = 1e-6
+        confidences = np.clip(confidences, eps, 1 - eps)
+        logits = np.log(confidences / (1 - confidences)).reshape(-1, 1)
+
+        calibrated = self.platt_model.predict_proba(logits)[:, 1]
+        return calibrated
+
+    # -------------------------------------------------
+    # Public transform: accepts list or tensor (any shape), returns tensor
+    # -------------------------------------------------
+    def transform(self, pred_confidence):
+        arr, shape, device, dtype = _to_numpy_flat(pred_confidence, force_float=True)
+
+        if self.method == "histogram":
+            calibrated = self._transform_histogram(arr)
+        elif self.method == "platt":
+            calibrated = self._transform_platt(arr)
+        else:
+            raise ValueError("method must be 'histogram' or 'platt'")
+
+        return _from_numpy_to_tensor(calibrated, shape, device, dtype)
+
+    # -------------------------------------------------
+    # ECE
+    # -------------------------------------------------
+    def compute_ece(self, pred_label, gt_label, pred_confidence):
+        pred_label, _, _, _ = _to_numpy_flat(pred_label, force_float=False)
+        gt_label, _, _, _ = _to_numpy_flat(gt_label, force_float=False)
+        pred_confidence, _, _, _ = _to_numpy_flat(pred_confidence, force_float=True)
+
+        correct = (pred_label == gt_label).astype(int)
+
+        bin_edges = np.linspace(0.0, 1.0, self.n_bins + 1)
+        ece = 0.0
+        n = len(pred_confidence)
+
+        for i in range(self.n_bins):
+            in_bin = (pred_confidence >= bin_edges[i]) & \
+                     (pred_confidence < bin_edges[i + 1])
+
+            if np.sum(in_bin) > 0:
+                bin_acc = np.mean(correct[in_bin])
+                bin_conf = np.mean(pred_confidence[in_bin])
+                ece += np.abs(bin_acc - bin_conf) * np.sum(in_bin) / n
+
+        return ece
+
 
 
 

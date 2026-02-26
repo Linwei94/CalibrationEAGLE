@@ -29,6 +29,7 @@ from torch import nn
 
 from transformers.activations import ACT2FN
 from huggingface_hub import hf_hub_download
+import joblib
 
 
 try:
@@ -39,7 +40,7 @@ except:
     from configs import EConfig
     from utils_c import *
     from choices import *
-    from utils import prepare_logits_processor
+    from utils import prepare_logits_processor, Calibration
 
 
 
@@ -543,6 +544,12 @@ class Model(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
+        if config.calibration is not None:
+            self.calibrator = Calibration(method="platt", n_bins=15)
+            self.calibrator.platt_model = joblib.load("/home/lwtao/CalibrationEAGLE/eagle/calibration/mt_bench/llama38b2_40-temperature-0.0/EAGLE3/calibrator_platt.pkl")
+        else:
+            self.calibrator = None
+
     def init_tree(self):
         self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
         self.position_ids = torch.zeros(self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
@@ -707,6 +714,13 @@ class Model(nn.Module):
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
+        
+        ######################################################### calibrate score using platt scaling #########################################################
+        if self.calibrator is not None:
+            calibrated_scores = self.calibrator.transform(scores.exp())
+            scores = calibrated_scores.log().to(scores.device)
+        ######################################################### calibrate score using platt scaling #########################################################
+        
         scores_list.append(scores[None])
         draft_probs_list.append(scores[None].exp())
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
@@ -741,6 +755,12 @@ class Model(nn.Module):
 
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
+            
+            ######################################################### calibrate score using platt scaling #########################################################
+            if self.calibrator is not None:
+                calibrated_scores = self.calibrator.transform(topk_p.exp())
+                topk_p = calibrated_scores.log().to(topk_p.device)
+            ######################################################### calibrate score using platt scaling #########################################################
 
             cu_scores = topk_p + scores[:, None]
 

@@ -4,6 +4,7 @@ import time
 
 import torch
 import torch.nn as nn
+import numpy as np
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 import os
@@ -35,6 +36,7 @@ class EaModel(nn.Module):
             top_k,
             threshold,
             ea_layer_state_dict,
+            use_calibration=False,
     ):
 
         super().__init__()
@@ -46,6 +48,10 @@ class EaModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
+        if use_calibration:
+            config.calibration = "platt"
+        else:
+            config.calibration = None
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
         try:
@@ -95,6 +101,7 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            use_calibration=False,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -142,7 +149,8 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            use_calibration=use_calibration,
         )
 
         if total_token == -1:
@@ -207,7 +215,10 @@ class EaModel(nn.Module):
             log=False,
             is_llama3=False,
             return_calibration_stats=False,
+            return_alpha=True,
     ):
+        if return_alpha:
+            alpha_list = []
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         
@@ -292,6 +303,8 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                     logits, candidates, logits_processor
                 )
+            if return_alpha:
+                alpha_list.append(accept_length.item())
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
             outputs = update_inference_inputs(
@@ -328,9 +341,9 @@ class EaModel(nn.Module):
             return input_ids
         else:
             if return_calibration_stats:
-                return input_ids, new_token, idx, calibration_stats
+                return input_ids, new_token, idx, calibration_stats, np.mean(alpha_list)
             else:
-                return input_ids, new_token, idx
+                return input_ids, new_token, idx, np.mean(alpha_list)
 
     @torch.no_grad()
     def naivegenerate(

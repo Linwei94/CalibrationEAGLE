@@ -5,7 +5,8 @@ import random
 from typing import List, Tuple
 import time
 import torch
-
+import numpy as np
+from sklearn.linear_model import LogisticRegression
 # TODO
 # from transformers import LlamaTokenizer
 # tokenizer=LlamaTokenizer.from_pretrained("/home/lyh/weights/hf/vicuna_v13/7B/")
@@ -491,6 +492,122 @@ def update_inference_inputs(
         return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token, draft_probs
     else:
         return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
+
+
+
+class Calibration:
+    def __init__(self, method="platt", n_bins=15):
+        """
+        method: "histogram" or "platt"
+        n_bins: number of bins for histogram binning
+        """
+        self.method = method
+        self.n_bins = n_bins
+        self.bin_edges = None
+        self.bin_acc = None
+        self.platt_model = None
+
+    # -------------------------------------------------
+    # Fit
+    # -------------------------------------------------
+    def fit(self, pred_label, gt_label, pred_confidence):
+        pred_label = np.array(pred_label)
+        gt_label = np.array(gt_label)
+        pred_confidence = np.array(pred_confidence)
+
+        correct = (pred_label == gt_label).astype(int)
+
+        if self.method == "histogram":
+            self._fit_histogram(pred_confidence, correct)
+
+        elif self.method == "platt":
+            self._fit_platt(pred_confidence, correct)
+
+        else:
+            raise ValueError("method must be 'histogram' or 'platt'")
+
+    # -------------------------------------------------
+    # Histogram Binning
+    # -------------------------------------------------
+    def _fit_histogram(self, confidences, correct):
+        self.bin_edges = np.linspace(0.0, 1.0, self.n_bins + 1)
+        self.bin_acc = np.zeros(self.n_bins)
+
+        for i in range(self.n_bins):
+            in_bin = (confidences >= self.bin_edges[i]) & \
+                     (confidences < self.bin_edges[i + 1])
+
+            if np.sum(in_bin) > 0:
+                self.bin_acc[i] = np.mean(correct[in_bin])
+            else:
+                self.bin_acc[i] = 0.0
+
+    def _transform_histogram(self, confidences):
+        calibrated = np.zeros_like(confidences)
+
+        for i in range(self.n_bins):
+            in_bin = (confidences >= self.bin_edges[i]) & \
+                     (confidences < self.bin_edges[i + 1])
+            calibrated[in_bin] = self.bin_acc[i]
+
+        return calibrated
+
+    # -------------------------------------------------
+    # Platt Scaling
+    # -------------------------------------------------
+    def _fit_platt(self, confidences, correct):
+        # convert confidence -> logit
+        eps = 1e-6
+        confidences = np.clip(confidences, eps, 1 - eps)
+        logits = np.log(confidences / (1 - confidences)).reshape(-1, 1)
+
+        self.platt_model = LogisticRegression()
+        self.platt_model.fit(logits, correct)
+
+    def _transform_platt(self, confidences):
+        eps = 1e-6
+        confidences = np.clip(confidences, eps, 1 - eps)
+        logits = np.log(confidences / (1 - confidences)).reshape(-1, 1)
+
+        calibrated = self.platt_model.predict_proba(logits)[:, 1]
+        return calibrated
+
+    # -------------------------------------------------
+    # Public transform
+    # -------------------------------------------------
+    def transform(self, pred_confidence):
+        pred_confidence = np.array(pred_confidence)
+
+        if self.method == "histogram":
+            return self._transform_histogram(pred_confidence)
+
+        elif self.method == "platt":
+            return self._transform_platt(pred_confidence)
+
+    # -------------------------------------------------
+    # ECE
+    # -------------------------------------------------
+    def compute_ece(self, pred_label, gt_label, pred_confidence):
+        pred_label = np.array(pred_label)
+        gt_label = np.array(gt_label)
+        pred_confidence = np.array(pred_confidence)
+
+        correct = (pred_label == gt_label).astype(int)
+
+        bin_edges = np.linspace(0.0, 1.0, self.n_bins + 1)
+        ece = 0.0
+        n = len(pred_confidence)
+
+        for i in range(self.n_bins):
+            in_bin = (pred_confidence >= bin_edges[i]) & \
+                     (pred_confidence < bin_edges[i + 1])
+
+            if np.sum(in_bin) > 0:
+                bin_acc = np.mean(correct[in_bin])
+                bin_conf = np.mean(pred_confidence[in_bin])
+                ece += np.abs(bin_acc - bin_conf) * np.sum(in_bin) / n
+
+        return ece
 
 
 if __name__ == "__main__":
